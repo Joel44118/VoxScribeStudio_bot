@@ -1,0 +1,3 @@
+aiohttp
+SpeechRecognition
+pocketsphinx
