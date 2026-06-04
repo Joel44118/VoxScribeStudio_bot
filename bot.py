@@ -3,6 +3,8 @@ import io
 import asyncio
 from aiohttp import web, ClientSession
 import speech_recognition as sr
+import soundfile as sf
+import librosa
 
 # 1. Fetch Environment Variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -15,7 +17,6 @@ async def handle_health(request):
 
 # 3. Handle Voice Messages
 async def process_voice(session, chat_id, file_id):
-    # Let the user know the bot is working
     await session.post(f"{API_URL}sendMessage", data={"chat_id": chat_id, "text": "🔄 Processing your voice note, please wait..."})
 
     try:
@@ -26,33 +27,39 @@ async def process_voice(session, chat_id, file_id):
                 raise Exception("Failed to get file data from Telegram.")
             file_path = res_data["result"]["file_path"]
 
-        # Download the file into memory
+        # Download the .ogg file into memory
         async with session.get(f"{FILE_URL}{file_path}") as file_res:
-            audio_data = await file_res.read()
+            ogg_bytes = await file_res.read()
 
-        # Audio Transcription Logic
-        recognizer = sr.Recognizer()
+        # Convert .ogg bytes to a format SpeechRecognition understands using pure Python
+        ogg_io = io.BytesIO(ogg_bytes)
+        audio_data, sample_rate = librosa.load(ogg_io, sr=16000) # Resample to 16kHz for accurate translation
         
-        # Open raw audio data using SpeechRecognition
-        # Note: Render free tier requires extremely lightweight processing
-        with sr.AudioFile(io.BytesIO(audio_data)) as source:
+        # Write it to an in-memory WAV container
+        wav_io = io.BytesIO()
+        sf.write(wav_io, audio_data, sample_rate, format='WAV', subtype='PCM_16')
+        wav_io.seek(0)
+
+        # Feed the clean WAV data to the Speech Engine
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_io) as source:
             audio = recognizer.record(source)
         
-        # Transcribe offline using pocket sphinx
+        # Transcribe offline using PocketSphinx
         text_result = recognizer.recognize_sphinx(audio)
         
         if not text_result.strip():
-            text_result = "⚠️ Speech detected, but I couldn't make out the words clearly."
-            
-        reply_text = f"📝 **Transcription:**\n\n\"{text_result}\""
+            reply_text = "⚠️ Speech detected, but I couldn't make out the words clearly."
+        else:
+            reply_text = f"📝 **Transcription:**\n\n\"{text_result}\""
 
     except sr.UnknownValueError:
         reply_text = "❌ Sorry, I couldn't understand the audio. Make sure it's clear and in English."
     except sr.RequestError as e:
         reply_text = f"❌ Error handling the speech engine: {e}"
     except Exception as e:
-        print(f"Error processing voice: {e}")
-        reply_text = "❌ An error occurred while converting your voice note. Please try a shorter message."
+        print(f"Detailed Error: {e}")
+        reply_text = "❌ An error occurred while processing the audio data. Try speaking closer to the mic."
 
     # Send the transcribed text back
     await session.post(f"{API_URL}sendMessage", data={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
@@ -77,18 +84,16 @@ async def bot_polling():
                             message = update.get("message", {})
                             chat_id = message.get("chat", {}).get("id")
                             text = message.get("text", "")
-                            voice = message.get("voice")  # Check if a voice note was sent
+                            voice = message.get("voice")
                             
                             if not chat_id:
                                 continue
                                 
                             if text == "/start":
-                                msg = "Hello! Send or forward me a voice note, and I will attempt to convert it to text."
+                                msg = "Hello! Send or forward me a voice note, and I will convert it to text."
                                 await session.post(f"{API_URL}sendMessage", data={"chat_id": chat_id, "text": msg})
                             elif voice:
-                                # Grab the Telegram file_id for the audio
                                 file_id = voice["file_id"]
-                                # Process audio asynchronously so the bot stays responsive
                                 asyncio.create_task(process_voice(session, chat_id, file_id))
                             elif text:
                                 await session.post(f"{API_URL}sendMessage", data={"chat_id": chat_id, "text": "🤖 I only accept voice notes! Send or forward me audio to begin."})
